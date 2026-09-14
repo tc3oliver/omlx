@@ -809,6 +809,7 @@ class TestApplyCacheSettingsRuntimeGdn:
         gs.cache.gdn_ssd_pending_max_size = "768MB"
         gs.cache.gdn_sidecar_state_dtype = "rht_int16"
         gs.cache.initial_cache_blocks = 1024
+        gs.cache.paged_cache_block_size = 512
 
         pool = MagicMock()
         pool._scheduler_config = SchedulerConfig()
@@ -829,6 +830,7 @@ class TestApplyCacheSettingsRuntimeGdn:
         assert pool._scheduler_config.gdn_ssd_pending_max_bytes == 768 * 1024**2
         assert pool._scheduler_config.gdn_sidecar_state_dtype == "rht_int16"
         assert pool._scheduler_config.initial_cache_blocks == 1024
+        assert pool._scheduler_config.paged_cache_block_size_override == 512
 
 
 class TestUpdateGlobalSettingsMidSystemCache:

@@ -355,6 +355,9 @@ class CacheSettings:
     # once, at the first ANE compile, so a change applies on restart.
     ane_compile_cache: bool = False
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
+    # Tokens per paged cache block. None keeps the model-derived selection
+    # (RotatingKVCache window alignment, ArraysCache hybrid enlargement).
+    paged_cache_block_size: int | None = None
     # None selects the policy automatically: use an SSD sidecar when the SSD
     # cache is enabled, otherwise keep GDN state embedded with the main cache.
     # True/False preserve the legacy explicit split/embedded choices.
@@ -452,6 +455,7 @@ class CacheSettings:
             "hot_cache_write_through": self.hot_cache_write_through,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
+            "paged_cache_block_size": self.paged_cache_block_size,
         }
 
     @classmethod
@@ -502,6 +506,7 @@ class CacheSettings:
             ),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
+            paged_cache_block_size=data.get("paged_cache_block_size"),
         )
 
 
@@ -1368,6 +1373,8 @@ class GlobalSettings:
             and args.initial_cache_blocks is not None
         ):
             self.cache.initial_cache_blocks = args.initial_cache_blocks
+        if getattr(args, "paged_cache_block_size", None) is not None:
+            self.cache.paged_cache_block_size = args.paged_cache_block_size
         if getattr(args, "no_cache", False):
             self.cache.enabled = False
 
@@ -1717,6 +1724,14 @@ class GlobalSettings:
                 f"Invalid initial_cache_blocks: "
                 f"{self.cache.initial_cache_blocks} (must be > 0)"
             )
+        if (
+            self.cache.paged_cache_block_size is not None
+            and self.cache.paged_cache_block_size <= 0
+        ):
+            errors.append(
+                f"Invalid paged_cache_block_size: "
+                f"{self.cache.paged_cache_block_size} (must be > 0)"
+            )
 
         # Sampling validation
         if (
@@ -1821,6 +1836,7 @@ class GlobalSettings:
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
             initial_cache_blocks=self.cache.initial_cache_blocks,
+            paged_cache_block_size_override=self.cache.paged_cache_block_size,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
             paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(

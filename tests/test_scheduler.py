@@ -3521,6 +3521,40 @@ class TestSchedulerRotatingBlockAlignment:
         # chunks reach the regime where the native prefill kernels pay off.
         assert scheduler.config.paged_cache_block_size == 2048
 
+    @pytest.mark.parametrize(("override", "expected"), [(256, 256), (100, None)])
+    def test_block_size_override_must_align_to_rotating_window(
+        self, mock_tokenizer, override, expected
+    ):
+        RotatingStub = type("RotatingKVCache", (), {})
+
+        class RotatingModel:
+            def __init__(self):
+                self.config = MagicMock()
+                self.config.num_hidden_layers = 1
+
+            def make_cache(self):
+                cache = RotatingStub()
+                cache.max_size = 128
+                return [cache]
+
+        config = SchedulerConfig(
+            paged_ssd_cache_dir="/tmp/cache",
+            paged_cache_block_size=256,
+            paged_cache_block_size_override=override,
+        )
+        if expected is None:
+            with pytest.raises(ValueError, match="multiple of"):
+                Scheduler(model=RotatingModel(), tokenizer=mock_tokenizer, config=config)
+            return
+
+        scheduler = Scheduler(
+            model=RotatingModel(), tokenizer=mock_tokenizer, config=config
+        )
+        try:
+            assert scheduler.config.paged_cache_block_size == expected
+        finally:
+            scheduler.shutdown()
+
     def test_multiple_rotating_window_sizes_raise(self, mock_tokenizer):
         RotatingStub = type("RotatingKVCache", (), {})
 
@@ -3976,7 +4010,7 @@ class TestSchedulerArraysCacheBlockAlignment:
         request.benchmark_trace = True
 
         try:
-            with patch.object(scheduler, "_emit_prefill_boundary_snapshot"):
+            with patch.object(scheduler, "_emit_prefill_boundary_snapshot") as emit:
                 scheduler._do_external_prefill(
                     request,
                     request.prompt_token_ids,
@@ -3986,6 +4020,98 @@ class TestSchedulerArraysCacheBlockAlignment:
             assert model.prefill_calls == [4096]
             assert request.benchmark_prefill_chunks == [4096]
             assert request.benchmark_cache_block_size == 4096
+            assert [c.args[2] for c in emit.call_args_list] == [4096]
+        finally:
+            scheduler.shutdown()
+
+    @staticmethod
+    def _prefill_boundaries(scheduler, model, n_tokens):
+        request = Request(
+            request_id=f"prefill-{n_tokens}",
+            prompt=list(range(n_tokens)),
+            sampling_params=SamplingParams(),
+        )
+        request.prompt_token_ids = list(range(n_tokens))
+        request.num_prompt_tokens = n_tokens
+        with patch.object(scheduler, "_emit_prefill_boundary_snapshot") as emit:
+            scheduler._do_external_prefill(
+                request, request.prompt_token_ids, model.make_cache()
+            )
+        return [c.args[2] for c in emit.call_args_list]
+
+    def test_qwen35_prompt_below_4096_block_has_no_boundary(
+        self, mock_tokenizer, tmp_path
+    ):
+        model = self._hybrid_model()
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+        ):
+            scheduler = Scheduler(
+                model=model,
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                ),
+            )
+
+        try:
+            assert self._prefill_boundaries(scheduler, model, 1500) == []
+            assert model.prefill_calls == [1499]
+        finally:
+            scheduler.shutdown()
+
+    @pytest.mark.parametrize("override", [1024, 2048])
+    def test_block_size_override_replaces_qwen35_auto_target(
+        self, mock_tokenizer, tmp_path, override
+    ):
+        model = self._hybrid_model()
+        with (
+            patch("omlx.settings.get_system_memory", return_value=64 * 1024**3),
+            patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
+        ):
+            scheduler = Scheduler(
+                model=model,
+                tokenizer=mock_tokenizer,
+                config=SchedulerConfig(
+                    paged_ssd_cache_dir=str(tmp_path),
+                    paged_cache_block_size=256,
+                    paged_cache_block_size_override=override,
+                ),
+            )
+
+        try:
+            assert scheduler._qwen35_prefill_floor == 4096
+            assert scheduler.config.paged_cache_block_size == override
+            # A prompt shorter than the auto-selected 4096 block now has a
+            # storable boundary; prefill chunks follow the narrower block.
+            short_prompt = override + 476
+            assert self._prefill_boundaries(scheduler, model, short_prompt) == [
+                override
+            ]
+            assert model.prefill_calls == [override, 475]
+            model.prefill_calls.clear()
+            assert self._prefill_boundaries(scheduler, model, 4097) == list(
+                range(override, 4097, override)
+            )
+            assert model.prefill_calls == [override] * (4096 // override)
+        finally:
+            scheduler.shutdown()
+
+    def test_block_size_override_ignored_without_paged_cache(
+        self, mock_tokenizer
+    ):
+        scheduler = Scheduler(
+            model=self._hybrid_model(),
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_cache_block_size=256,
+                paged_cache_block_size_override=1024,
+            ),
+        )
+        try:
+            assert scheduler.config.paged_cache_block_size == 256
         finally:
             scheduler.shutdown()
 

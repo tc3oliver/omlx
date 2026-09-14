@@ -447,6 +447,7 @@ class TestCacheSettings:
         assert settings.gdn_sidecar_state_dtype == "fp32"
         assert settings.ane_compile_cache is False
         assert settings.initial_cache_blocks == 256
+        assert settings.paged_cache_block_size is None
 
     def test_get_ssd_cache_dir_default(self):
         """Test default SSD cache directory."""
@@ -493,6 +494,7 @@ class TestCacheSettings:
             "hot_cache_write_through": False,
             "ane_compile_cache": False,
             "initial_cache_blocks": 256,
+            "paged_cache_block_size": None,
         }
 
     def test_from_dict(self):
@@ -652,6 +654,12 @@ class TestCacheSettings:
         assert settings.initial_cache_blocks == 8192
         result = settings.to_dict()
         assert result["initial_cache_blocks"] == 8192
+
+    def test_paged_cache_block_size_round_trip(self):
+        settings = CacheSettings.from_dict({"paged_cache_block_size": 1024})
+        assert settings.paged_cache_block_size == 1024
+        assert settings.to_dict()["paged_cache_block_size"] == 1024
+        assert CacheSettings.from_dict({}).paged_cache_block_size is None
 
 
 class TestAuthSettings:
@@ -1794,6 +1802,17 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert any("initial_cache_blocks" in e.lower() for e in errors)
 
+    @pytest.mark.parametrize("value", [0, -512])
+    def test_validate_invalid_paged_cache_block_size(self, value):
+        settings = GlobalSettings()
+        settings.cache.paged_cache_block_size = value
+        errors = settings.validate()
+        assert any("paged_cache_block_size" in e for e in errors)
+
+    def test_validate_accepts_unset_paged_cache_block_size(self):
+        settings = GlobalSettings()
+        assert not any("paged_cache_block_size" in e for e in settings.validate())
+
     def test_validate_multiple_errors(self):
         """Test validation returns multiple errors."""
         settings = GlobalSettings()
@@ -2120,6 +2139,14 @@ class TestGlobalSettings:
             assert settings.cache.ssd_cache_max_size == "500GB"
             assert settings.cache.hot_cache_max_size == "8GB"
 
+    def test_cli_override_paged_cache_block_size(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings._apply_cli_overrides(Namespace(paged_cache_block_size=None))
+            assert settings.cache.paged_cache_block_size is None
+            settings._apply_cli_overrides(Namespace(paged_cache_block_size=1024))
+            assert settings.cache.paged_cache_block_size == 1024
+
     def test_cli_override_no_cache(self):
         """--no-cache persists an explicit cache disablement."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2270,6 +2297,16 @@ class TestGlobalSettings:
 
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.initial_cache_blocks == 8192
+
+    def test_to_scheduler_config_paged_cache_block_size(self):
+        settings = GlobalSettings()
+        assert settings.to_scheduler_config().paged_cache_block_size_override is None
+        assert settings.to_scheduler_config().paged_cache_block_size == 256
+
+        settings.cache.paged_cache_block_size = 1024
+        scheduler_config = settings.to_scheduler_config()
+        assert scheduler_config.paged_cache_block_size_override == 1024
+        assert scheduler_config.paged_cache_block_size == 256
 
     def test_to_scheduler_config_gdn_split_settings(self):
         """GDN settings are attached to the scheduler config for later runtime use."""

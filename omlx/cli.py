@@ -66,6 +66,7 @@ def _has_cli_overrides(args) -> bool:
         "hot_cache_max_size",
         "hot_cache_write_through",
         "initial_cache_blocks",
+        "paged_cache_block_size",
         "mcp_config",
         "hf_endpoint",
         "hf_cache_enabled",
@@ -1173,6 +1174,15 @@ Example directory structure:
         default=None,
         help="Number of cache blocks to pre-allocate at startup (default: 256). "
         "Higher values reduce dynamic allocation overhead for large contexts.",
+    )
+    serve_parser.add_argument(
+        "--paged-cache-block-size",
+        type=int,
+        default=None,
+        help="Tokens per paged cache block. Default: selected per model "
+        "(2048-4096 for GDN hybrids such as Qwen3.5/3.6). Smaller blocks let "
+        "prompts shorter than one block be cached, at the cost of narrower "
+        "prefill chunks on hybrid models.",
     )
 
     # MCP options

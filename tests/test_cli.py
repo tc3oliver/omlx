@@ -946,6 +946,7 @@ class TestServeCommandFunctions:
             "hot_cache_max_size": None,
             "no_cache": True,
             "initial_cache_blocks": None,
+            "paged_cache_block_size": None,
             "mcp_config": None,
             "hf_endpoint": None,
             "hf_cache_enabled": None,
@@ -1250,6 +1251,7 @@ class TestHasCliOverrides:
             "hot_cache_max_size": None,
             "no_cache": False,
             "initial_cache_blocks": None,
+            "paged_cache_block_size": None,
             "mcp_config": None,
             "hf_endpoint": None,
             "hf_cache_enabled": None,
@@ -1324,6 +1326,7 @@ class TestHasCliOverrides:
             ("hot_cache_max_size", "1GB"),
             ("no_cache", True),
             ("initial_cache_blocks", 64),
+            ("paged_cache_block_size", 1024),
         ],
     )
     def test_all_persisted_serve_flags_count_as_overrides(self, field, value):

@@ -1634,6 +1634,9 @@ class SchedulerConfig:
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
+    # Explicit block size (settings cache.paged_cache_block_size). None keeps
+    # the model-derived auto-selection below.
+    paged_cache_block_size_override: int | None = None
     max_cache_blocks: int | None = (
         None  # Auto-calculated from available KV cache memory
     )
@@ -1871,6 +1874,7 @@ class Scheduler:
         # For ArraysCache-only models (no RotatingKVCache), use a larger block
         # size to reduce boundary snapshot overhead during prefill.
         self._enlarge_block_size_for_arrays_cache()
+        self._apply_block_size_override()
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
@@ -2899,6 +2903,35 @@ class Scheduler:
             target,
         )
         self.config.paged_cache_block_size = target
+
+    def _apply_block_size_override(self) -> None:
+        """Replace the auto-selected block size with an explicit one.
+
+        Prefill chunks are clamped to block boundaries, so on ArraysCache
+        hybrids a block narrower than the effective prefill step also splits
+        the cache-ON forward schedule at that width. That is the trade the
+        operator opts into for short-prompt prefix reuse.
+        """
+        override = self.config.paged_cache_block_size_override
+        if not override or not self.config.paged_ssd_cache_dir:
+            return
+
+        window_sizes = self._detect_rotating_window_sizes()
+        if window_sizes:
+            window_size = next(iter(window_sizes))
+            if override % window_size != 0:
+                raise ValueError(
+                    f"paged_cache_block_size={override} must be a multiple of "
+                    f"the RotatingKVCache window size ({window_size})"
+                )
+
+        if self.config.paged_cache_block_size != override:
+            logger.info(
+                "Using configured paged cache block_size=%s (auto-selected %s)",
+                override,
+                self.config.paged_cache_block_size,
+            )
+            self.config.paged_cache_block_size = override
 
     def _model_has_arrays_cache(self) -> bool:
         """Whether the model's cache layout contains ArraysCache layers."""

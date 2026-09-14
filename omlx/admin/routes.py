@@ -406,6 +406,7 @@ class GlobalSettingsRequest(BaseModel):
     gdn_sidecar_precision: str | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
+    paged_cache_block_size: int | None = None  # Tokens per block (requires reload)
 
     # MCP settings
     mcp_config: str | None = None
@@ -1122,6 +1123,9 @@ async def _apply_cache_settings_runtime(
     )
     pool._scheduler_config.initial_cache_blocks = (
         global_settings.cache.initial_cache_blocks
+    )
+    pool._scheduler_config.paged_cache_block_size_override = (
+        global_settings.cache.paged_cache_block_size
     )
 
     # Update scheduler config based on cache settings
@@ -3960,6 +3964,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "gdn_sidecar_precision": global_settings.cache.gdn_sidecar_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
+            "paged_cache_block_size": global_settings.cache.paged_cache_block_size,
         },
         "mcp": {
             "config_path": global_settings.mcp.config_path,
@@ -4451,6 +4456,14 @@ async def update_global_settings(
             status_code=400,
             detail="initial_cache_blocks must be positive",
         )
+    if (
+        request.paged_cache_block_size is not None
+        and request.paged_cache_block_size <= 0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="paged_cache_block_size must be positive",
+        )
 
     # GDN sidecar persistence requires the SSD tier. Validate the effective
     # values before mutating the live settings object so an invalid admin
@@ -4574,6 +4587,9 @@ async def update_global_settings(
         cache_changed = True
     if request.initial_cache_blocks is not None:
         global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
+        cache_changed = True
+    if request.paged_cache_block_size is not None:
+        global_settings.cache.paged_cache_block_size = request.paged_cache_block_size
         cache_changed = True
     # No cache_changed: reloading models cannot re-arm the native gate, which
     # reads the env var once at the first ANE compile of the process. The env
