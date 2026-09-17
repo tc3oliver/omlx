@@ -512,6 +512,12 @@ class _PrefillState:
     sm: Any = None
     per_row_lps: Any = None
     qwen4_gathered_core: bool | None = None
+    # Canonical prefill width for this request (0 = not applicable). A
+    # stateful non-sliceable cache evolves its recurrent state chunk by chunk,
+    # so where the boundaries land is part of the computation: the width is
+    # chosen once and may only step down whole ladder rungs.
+    canonical_width: int = 0
+    width_fallbacks: int = 0
 
 
 @dataclass
@@ -4462,6 +4468,151 @@ class Scheduler:
                 high = units - 1
         return best
 
+    _CANONICAL_WIDTH_FLOOR = 512
+
+    def _canonical_prefill_ladder(self, step: int) -> tuple[int, ...]:
+        """Widths this request may use, widest first: step, step/2, step/4.
+
+        Halving keeps every rung a divisor of the widest, so a step-down still
+        lands on the block boundaries the cache expects and boundary snapshots
+        keep firing where they did before.
+        """
+        rungs: list[int] = []
+        w = int(step)
+        while w >= self._CANONICAL_WIDTH_FLOOR and len(rungs) < 3:
+            if w not in rungs:
+                rungs.append(w)
+            w //= 2
+        return tuple(rungs) or (max(1, int(step)),)
+
+    def _next_canonical_width(self, current: int, step: int) -> int | None:
+        """The next narrower rung, or None when already at the narrowest."""
+        ladder = self._canonical_prefill_ladder(step)
+        for i, w in enumerate(ladder):
+            if w == current:
+                return ladder[i + 1] if i + 1 < len(ladder) else None
+        return ladder[-1] if current > ladder[-1] else None
+
+    def _canonical_prefill_active(self, state: Any) -> bool:
+        """Whether this request's prefill width must stay fixed.
+
+        Only where the partition changes the result: a sliceable KV-only cache
+        reconstructs identically whatever the chunk sizes were, while a
+        stateful non-sliceable layer (GatedDeltaNet and other recurrent
+        hybrids) carries state across chunks. Speed priority already pins the
+        width by refusing to shrink at all, so that path is left alone.
+        """
+        if getattr(self, "_prefill_speed_priority", False):
+            return False
+        try:
+            return self._cache_list_needs_boundary_snapshot(state.cache)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _plan_prefill_chunk(
+        self,
+        state: Any,
+        *,
+        remaining: int,
+        prefill_step_size: int,
+        kv_len: int,
+        gathered_core: bool,
+    ) -> int:
+        """Size the next prefill chunk, holding the request's width steady.
+
+        Without a canonical width the throttle and the guard each answer with
+        whatever size happens to fit right now, so the partition — and for a
+        recurrent hybrid the output — depends on this process's memory
+        history. Here their "too wide" verdict instead steps the whole request
+        down one ladder rung. The narrowest rung defers to them: memory safety
+        outranks determinism, and the guard still aborts cleanly.
+        """
+        canonical = Scheduler._canonical_prefill_active(self, state)
+        if canonical and state.canonical_width == 0:
+            ladder = Scheduler._canonical_prefill_ladder(self, prefill_step_size)
+            state.canonical_width = ladder[0]
+            logger.debug(
+                "[prefill:canonical] rid=%s requested_width=%d selected_width=%d "
+                "ladder=%s",
+                state.request.request_id,
+                prefill_step_size,
+                state.canonical_width,
+                ladder,
+            )
+
+        while True:
+            width = state.canonical_width if canonical else prefill_step_size
+            n = min(width, remaining)
+
+            # Clamp to the next block boundary so boundary snapshots fire
+            # exactly. A short tail before a boundary is expected, not
+            # pressure, so the step-down test below compares against this.
+            if state.boundary_enabled and state.block_size > 0:
+                n = clamp_prefill_chunk_to_boundary(
+                    n,
+                    cache_tokens=kv_len,
+                    block_size=state.block_size,
+                )
+            planned = n
+
+            # Adaptive throttle — see _adaptive_chunk_size docstring. Raises
+            # if even prefill_min_chunk_tokens would exceed the cap; #1405
+            # cleanup paths in _schedule_waiting / _advance_chunked_prefills
+            # convert that into a finish_reason="error" output for the client.
+            n = self._adaptive_chunk_size(
+                n,
+                request_id=state.request.request_id,
+                loop_label="chunked_step",
+                kv_len=kv_len,
+                gathered_core=gathered_core,
+            )
+
+            # Pre-chunk safety guard (mirrors the external loop): never submit
+            # a chunk whose predicted peak would trip the uncatchable async
+            # Metal OOM.
+            n = self._guard_prefill_chunk(
+                n,
+                kv_len=kv_len,
+                progress=state.tokens_processed,
+                loop_label="chunked_step",
+                request_id=state.request.request_id,
+                gathered_core=gathered_core,
+            )
+
+            if not canonical or n >= planned:
+                return n
+
+            narrower = Scheduler._next_canonical_width(
+                self, state.canonical_width, prefill_step_size
+            )
+            if narrower is None:
+                logger.debug(
+                    "[prefill:canonical] rid=%s ladder exhausted at width=%d; "
+                    "accepting throttled chunk=%d",
+                    state.request.request_id,
+                    state.canonical_width,
+                    n,
+                )
+                return n
+
+            state.width_fallbacks += 1
+            # WARNING, not INFO: the partition changes the recurrent state
+            # of every later chunk, so a temperature-0 reply can differ from
+            # a process that did not hit this pressure at this point.
+            logger.warning(
+                "[prefill:canonical] rid=%s width %d -> %d for the whole request "
+                "(reason=memory_pressure planned=%d allowed=%d kv_len=%d "
+                "fallbacks=%d); greedy output may differ from an unpressured run",
+                state.request.request_id,
+                state.canonical_width,
+                narrower,
+                planned,
+                n,
+                kv_len,
+                state.width_fallbacks,
+            )
+            state.canonical_width = narrower
+
     def _snap_chunk_size(self, n: int, requested: int) -> int:
         """Quantize a throttled chunk to a multiple of the min-chunk floor.
 
@@ -5507,8 +5658,6 @@ class Scheduler:
         prefill_step_size = self._prefill_step_size_for_progress(
             state.tokens_processed, remaining
         )
-        n = min(prefill_step_size, remaining)
-
         if state.tokens_processed == 0:
             Scheduler._clear_cache(self)
             Scheduler._announce_first_prefill_chunk(self, state.tokens_remaining, state.base_size, state.boundary_enabled, state.block_size, None)
@@ -5521,39 +5670,17 @@ class Scheduler:
                 + len(state.last_token),
             )
 
-        # Clamp to the next block boundary so boundary snapshots fire exactly.
-        if state.boundary_enabled and state.block_size > 0:
-            n = clamp_prefill_chunk_to_boundary(
-                n,
-                cache_tokens=state.base_size + state.tokens_processed,
-                block_size=state.block_size,
-            )
-
-        # Adaptive throttle — see _adaptive_chunk_size docstring. Raises
-        # if even prefill_min_chunk_tokens would exceed the cap; #1405
-        # cleanup paths in _schedule_waiting / _advance_chunked_prefills
-        # convert that into a finish_reason="error" output for the client.
         # Chunked prefill is text-only (VLM never builds _PrefillState).
         qwen4_accounting = Scheduler._qwen4_prefill_accounting_enabled(self)
         if qwen4_accounting and state.qwen4_gathered_core is None:
             state.qwen4_gathered_core = self._qwen4_text_gathered_pricing(True)
         gathered_core = state.qwen4_gathered_core or False
-        n = self._adaptive_chunk_size(
-            n,
-            request_id=state.request.request_id,
-            loop_label="chunked_step",
+        n = Scheduler._plan_prefill_chunk(
+            self,
+            state,
+            remaining=remaining,
+            prefill_step_size=prefill_step_size,
             kv_len=state.base_size + state.tokens_processed,
-            gathered_core=gathered_core,
-        )
-
-        # Pre-chunk safety guard (mirrors the external loop): never submit a
-        # chunk whose predicted peak would trip the uncatchable async Metal OOM.
-        n = self._guard_prefill_chunk(
-            n,
-            kv_len=state.base_size + state.tokens_processed,
-            progress=state.tokens_processed,
-            loop_label="chunked_step",
-            request_id=state.request.request_id,
             gathered_core=gathered_core,
         )
         # Count only tokens actually passed to the model.
