@@ -6626,6 +6626,25 @@ async def create_anthropic_message(
         if request.stop_sequences:
             chat_kwargs["stop"] = request.stop_sequences
 
+        # SpecPrefill defaults OFF on this transport.
+        #
+        # Coding agents drive long, continuation-heavy sessions over
+        # /v1/messages: each request extends the previous one and depends on
+        # the reusable dense prefix checkpoint. A sparse prefill cannot be
+        # stored, so it leaves the checkpoint where it was and every later
+        # request re-prefills the same gap. Measured on this deployment that
+        # cache debt outgrows the one-request saving within about three
+        # requests, and a session pays it dozens of times over.
+        #
+        # /v1/chat/completions keeps the model-level default, which remains
+        # right for cold one-shot long prompts where nothing follows to pay
+        # the debt. This is a deployment policy for this serving setup, not a
+        # claim that every Anthropic-API client is continuation-heavy --
+        # clients that want sparse prefill ask for it explicitly.
+        chat_kwargs["specprefill"] = (
+            request.specprefill if request.specprefill is not None else False
+        )
+
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
         await _raise_if_llm_lease_abort_requested(lease)

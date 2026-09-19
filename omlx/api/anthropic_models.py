@@ -200,6 +200,9 @@ class MessagesRequest(BaseModel):
     thinking: ThinkingConfig | None = None
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: dict[str, Any] | None = None
+    # Opt back into sparse prefill on a transport that defaults it off;
+    # see create_anthropic_message for why this differs from /v1/chat/completions.
+    specprefill: bool | None = None
 
 
 # =============================================================================
