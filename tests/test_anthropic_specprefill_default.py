@@ -120,8 +120,19 @@ def test_no_draft_model_means_no_scoring(monkeypatch):
 
 # --- structural guard on the handler ----------------------------------------
 
-def test_handler_sets_specprefill_unconditionally_defaulting_to_false():
-    """Regression guard: the default must not become conditional or vanish.
+def test_handler_forwards_specprefill_only_when_the_client_asked():
+    """Regression guard: this transport must not reacquire a default of its own.
+
+    It had one. `/v1/messages` forced `specprefill=False` because a sparse
+    prefill could not be stored and the cache debt outgrew the saving within
+    about three requests. Canonical state recovery repays that debt, so the
+    transport went back to the model-level default -- which it gets by *not*
+    writing the key when the client says nothing.
+
+    Writing it unconditionally is the bug this guards: `False` would pin every
+    coding-agent session back to dense prefill, and `True` would force sparse
+    prefill on a deployment whose recovery budget is 0.0 and therefore never
+    repays anything. Both are silent.
 
     Parsed rather than string-matched so reformatting does not break it.
     """
@@ -138,11 +149,22 @@ def test_handler_sets_specprefill_unconditionally_defaulting_to_false():
     ]
     assert len(assigns) == 1, "expected exactly one specprefill assignment"
 
-    # value must be `request.specprefill if ... is not None else False`
-    value = assigns[0].value
-    assert isinstance(value, ast.IfExp), "default must be an inline conditional"
-    assert isinstance(value.orelse, ast.Constant) and value.orelse.value is False, \
-        "the fallback when the client says nothing must be False"
+    assign = assigns[0]
+    assert isinstance(assign.value, ast.Attribute) \
+        and assign.value.attr == "specprefill" \
+        and getattr(assign.value.value, "id", None) == "request", \
+        "the client value must be forwarded verbatim, not defaulted"
+
+    guards = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.If) and any(a is assign for a in ast.walk(n))
+    ]
+    assert guards, "the assignment must sit behind an `is not None` guard"
+    test = guards[-1].test
+    assert isinstance(test, ast.Compare) and isinstance(test.ops[0], ast.IsNot) \
+        and isinstance(test.comparators[0], ast.Constant) \
+        and test.comparators[0].value is None, \
+        "the guard must be `request.specprefill is not None`"
 
 
 def test_openai_handler_still_only_sets_specprefill_when_client_asked():

@@ -6626,24 +6626,32 @@ async def create_anthropic_message(
         if request.stop_sequences:
             chat_kwargs["stop"] = request.stop_sequences
 
-        # SpecPrefill defaults OFF on this transport.
+        # SpecPrefill follows the model-level default on this transport, as it
+        # does on /v1/chat/completions, and an explicit value still wins.
         #
-        # Coding agents drive long, continuation-heavy sessions over
-        # /v1/messages: each request extends the previous one and depends on
-        # the reusable dense prefix checkpoint. A sparse prefill cannot be
-        # stored, so it leaves the checkpoint where it was and every later
-        # request re-prefills the same gap. Measured on this deployment that
-        # cache debt outgrows the one-request saving within about three
-        # requests, and a session pays it dozens of times over.
+        # It used to default OFF here. The reason was real: coding agents drive
+        # long, continuation-heavy sessions over /v1/messages, each request
+        # extending the last and depending on the reusable dense prefix
+        # checkpoint. A sparse prefill could not be stored, so it left the
+        # checkpoint where it was and every later request re-prefilled the same
+        # gap; measured on this deployment that cache debt outgrew the
+        # one-request saving within about three requests.
         #
-        # /v1/chat/completions keeps the model-level default, which remains
-        # right for cold one-shot long prompts where nothing follows to pay
-        # the debt. This is a deployment policy for this serving setup, not a
-        # claim that every Anthropic-API client is continuation-heavy --
-        # clients that want sparse prefill ask for it explicitly.
-        chat_kwargs["specprefill"] = (
-            request.specprefill if request.specprefill is not None else False
-        )
+        # Canonical state recovery repays that debt. The scheduler re-reads the
+        # sparsely-served range densely in idle time and publishes block-aligned
+        # canonical prefixes through the ordinary store path, so a sparse
+        # prefill no longer pins the checkpoint. The premise of the OFF default
+        # was the debt, not sparsity itself.
+        #
+        # This is a deployment policy for this serving setup, and it depends on
+        # recovery actually being served: `canonical_state_recovery_enabled` on
+        # the model and a non-zero
+        # `scheduler.canonical_state_recovery_global_budget_pct`. The budget
+        # defaults to 0.0, which admits the recovery job and never serves it --
+        # with recovery off, the old OFF default is the right one and a client
+        # that wants dense prefill should send `specprefill: false`.
+        if request.specprefill is not None:
+            chat_kwargs["specprefill"] = request.specprefill
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
