@@ -492,6 +492,12 @@ class TestCacheSettings:
             "hot_cache_write_through": False,
             "ane_compile_cache": False,
             "initial_cache_blocks": 256,
+            # Production-only: `cache.arrays_cache_block_size` comes from the
+            # re-cut of upstream PR #3439 this build carries. `to_dict` has
+            # emitted it since that patch landed; this exact-match assertion
+            # was never updated with it, so the suite has been one failure
+            # short of green ever since.
+            "arrays_cache_block_size": None,
         }
 
     def test_from_dict(self):
