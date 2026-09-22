@@ -181,6 +181,95 @@ def _find_attention_layers(model) -> List[Tuple[int, Any]]:
     return results
 
 
+class IndeterminateCacheOffsetError(RuntimeError):
+    """A non-empty cache was supplied whose token position cannot be read.
+
+    Treating this as 0 would re-prefill a prompt on top of state that already
+    holds it, duplicating the prefix, so it is raised rather than guessed.
+    """
+
+
+def _leaf_cache_offset(cache_entry: Any) -> Optional[int]:
+    """Integer ``offset`` of *cache_entry*, descending into composite caches."""
+    subs = getattr(cache_entry, "caches", None)
+    if isinstance(subs, (list, tuple)):
+        for sub in subs:
+            offset = _leaf_cache_offset(sub)
+            if offset is not None:
+                return offset
+        return None
+    offset = getattr(cache_entry, "offset", None)
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        return None
+    return int(offset)
+
+
+def _logical_cache_offset(model, cache: List[Any]) -> int:
+    """Tokens already held by *cache*, read from the layers that count them.
+
+    Recurrent layers (ArraysCache and friends) carry a fixed-size summary
+    rather than a growing sequence, so they expose no ``offset``. On a hybrid
+    model layer 0 is one of those, and reading ``cache[0].offset`` therefore
+    reports 0 for a fully restored cache. Ask the attention layers instead --
+    the same mapping ``sparse_prefill`` already uses.
+
+    Offset-bearing layers are cross-checked: they describe one sequence, so a
+    disagreement means at least one is wrong. The smallest wins, since
+    prefilling a token twice is recoverable and skipping one is not.
+
+    Raises:
+        IndeterminateCacheOffsetError: the cache holds state but no layer
+            reports a position.
+    """
+    offsets: List[int] = []
+    try:
+        attn_layers = _find_attention_layers(model)
+        layer_to_cache = _build_layer_to_cache_map(model)
+    except Exception:  # noqa: BLE001 - fall back to scanning every layer
+        attn_layers, layer_to_cache = [], {}
+
+    for layer_idx, _layer in attn_layers:
+        cache_idx = layer_to_cache.get(layer_idx, layer_idx)
+        if 0 <= cache_idx < len(cache):
+            offset = _leaf_cache_offset(cache[cache_idx])
+            if offset is not None:
+                offsets.append(offset)
+
+    if not offsets:
+        # Architectures this module does not recognize still get an answer if
+        # any layer tracks a position.
+        for entry in cache:
+            offset = _leaf_cache_offset(entry)
+            if offset is not None:
+                offsets.append(offset)
+
+    if not offsets:
+        if any(not _cache_entry_is_empty(entry) for entry in cache):
+            raise IndeterminateCacheOffsetError(
+                f"cache of {len(cache)} layers holds state but reports no "
+                f"token offset; refusing to assume 0"
+            )
+        return 0
+
+    return min(offsets)
+
+
+def _cache_entry_is_empty(cache_entry: Any) -> bool:
+    """Best-effort emptiness check used only to reject a silent zero."""
+    empty = getattr(cache_entry, "empty", None)
+    if callable(empty):
+        try:
+            return bool(empty())
+        except Exception:  # noqa: BLE001
+            return True
+    state = getattr(cache_entry, "state", None)
+    if state is None:
+        return True
+    if isinstance(state, (list, tuple)):
+        return not any(getattr(item, "size", 0) for item in state if item is not None)
+    return not getattr(state, "size", 0)
+
+
 def _get_attn_module(layer):
     """Get attention module from a layer (self_attn or mixer)."""
     if hasattr(layer, "self_attn"):
@@ -505,7 +594,7 @@ def score_tokens(
     # Phase 1: Prefill (full or suffix-only if cache provided)
     if existing_cache is not None:
         cache = existing_cache
-        cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
+        cached_len = _logical_cache_offset(model, cache)
         suffix = tokens[cached_len:]
         if suffix:
             logits = _prefill_draft(
@@ -540,7 +629,10 @@ def score_tokens(
     # Record cache offset before lookahead so we can trim afterwards.
     # Lookahead decode appends n_lookahead+1 tokens to the cache which
     # must NOT be persisted when the caller stores the cache to SSD.
-    pre_lookahead_offset = cache[0].offset if hasattr(cache[0], "offset") else n_prompt
+    try:
+        pre_lookahead_offset = _logical_cache_offset(model, cache)
+    except IndeterminateCacheOffsetError:
+        pre_lookahead_offset = n_prompt
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -883,14 +975,10 @@ def sparse_prefill(
 
     # Detect initial cache offset (non-zero when system KV is restored)
     attn_layers = _find_attention_layers(model)
-    layer_to_cache = _build_layer_to_cache_map(model)
-    first_attn_layer_idx = attn_layers[0][0]
-    first_attn_cache_idx = layer_to_cache[first_attn_layer_idx]
-    cache_start = (
-        cache[first_attn_cache_idx].offset
-        if hasattr(cache[first_attn_cache_idx], "offset")
-        else 0
-    )
+    try:
+        cache_start = _logical_cache_offset(model, cache)
+    except IndeterminateCacheOffsetError:
+        cache_start = 0
 
     # Check if model has RoPE (Nemotron-H doesn't)
     first_attn = _get_attn_module(attn_layers[0][1])

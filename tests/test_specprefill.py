@@ -906,3 +906,358 @@ class TestTargetPrefillLeftoverCleanup:
         # Entry cleanup must restore the genuine rope before prefill runs
         assert seen["rope"] is genuine
         assert layer.self_attn.rope is genuine
+
+
+class TestLogicalCacheOffset:
+    """Tests for _logical_cache_offset() — the token position of a cache.
+
+    Hybrid GDN models put a recurrent layer at index 0. That layer holds a
+    fixed-size summary and exposes no ``offset``, so reading ``cache[0].offset``
+    reports 0 for a fully restored cache: the prompt is then re-prefilled on
+    top of the state that already holds it.
+    """
+
+    @staticmethod
+    def _model(layer_kinds):
+        """Model whose layers are attention ("a") or recurrent ("r")."""
+        from types import SimpleNamespace
+
+        layers = [
+            SimpleNamespace(self_attn=object()) if kind == "a" else SimpleNamespace()
+            for kind in layer_kinds
+        ]
+        return SimpleNamespace(layers=layers)
+
+    @staticmethod
+    def _kv(offset):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(offset=offset, state=(1, 1))
+
+    @staticmethod
+    def _recurrent():
+        """Stands in for ArraysCache: real state, no ``offset``."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(state=(1, 1), empty=lambda: False)
+
+    def test_pure_kv_cache_is_unchanged(self):
+        from omlx.patches.specprefill import _logical_cache_offset
+
+        model = self._model("aaaa")
+        cache = [self._kv(512) for _ in range(4)]
+        assert _logical_cache_offset(model, cache) == 512
+
+    def test_empty_pure_kv_cache_is_zero(self):
+        from omlx.patches.specprefill import _logical_cache_offset
+
+        model = self._model("aa")
+        assert _logical_cache_offset(model, [self._kv(0), self._kv(0)]) == 0
+
+    def test_hybrid_cache_reads_past_the_recurrent_layer_zero(self):
+        from omlx.patches.specprefill import _logical_cache_offset
+
+        # layer 0 is recurrent, as on Qwen3.5: cache[0] has no offset at all.
+        model = self._model("rrra")
+        cache = [self._recurrent(), self._recurrent(), self._recurrent(), self._kv(12288)]
+        assert not hasattr(cache[0], "offset")
+        assert _logical_cache_offset(model, cache) == 12288
+
+    def test_disagreeing_layers_take_the_smallest(self):
+        from omlx.patches.specprefill import _logical_cache_offset
+
+        # One sequence cannot be at two positions; re-prefilling a token is
+        # recoverable, skipping one is not.
+        model = self._model("rara")
+        cache = [self._recurrent(), self._kv(8192), self._recurrent(), self._kv(12288)]
+        assert _logical_cache_offset(model, cache) == 8192
+
+    def test_state_bearing_cache_without_any_offset_is_refused(self):
+        from omlx.patches.specprefill import (
+            IndeterminateCacheOffsetError,
+            _logical_cache_offset,
+        )
+
+        # Silently answering 0 here is what duplicates the prefix.
+        model = self._model("rr")
+        with pytest.raises(IndeterminateCacheOffsetError):
+            _logical_cache_offset(model, [self._recurrent(), self._recurrent()])
+
+    def test_composite_cache_offset_is_found_in_a_sub_cache(self):
+        from types import SimpleNamespace
+
+        from omlx.patches.specprefill import _logical_cache_offset
+
+        model = self._model("ra")
+        composite = SimpleNamespace(caches=[self._kv(4096), self._recurrent()])
+        assert _logical_cache_offset(model, [self._recurrent(), composite]) == 4096
+
+    def test_unrecognized_topology_still_finds_an_offset(self):
+        from types import SimpleNamespace
+
+        from omlx.patches.specprefill import _logical_cache_offset
+
+        # No layer advertises self_attn, so the attention mapping is empty and
+        # the scan over every layer is what answers.
+        model = SimpleNamespace(layers=[SimpleNamespace(), SimpleNamespace()])
+        assert _logical_cache_offset(model, [self._recurrent(), self._kv(777)]) == 777
+
+
+class _HybridFixture:
+    """Smallest model that reproduces the hybrid cache layout.
+
+    Layer 0 is recurrent and exposes no ``offset``; a later layer is attention
+    and does. Any code that asks ``cache[0]`` for the token position gets 0 no
+    matter how much state the cache holds.
+    """
+
+    VOCAB = 16
+    HEADS = 2
+    HEAD_DIM = 8
+
+    class RecurrentCache:
+        """ArraysCache-shaped: fixed-size summary, deliberately no ``offset``."""
+
+        def __init__(self):
+            self.cache = [None, None]
+            self.seen = 0
+
+        @property
+        def state(self):
+            return tuple(self.cache)
+
+        def empty(self):
+            return self.seen == 0
+
+    class KVCache:
+        def __init__(self):
+            self.keys = None
+            self.values = None
+            self.offset = 0
+
+        def update_and_fetch(self, keys, values):
+            self.keys = keys if self.keys is None else mx.concatenate(
+                [self.keys, keys], axis=2
+            )
+            self.values = values if self.values is None else mx.concatenate(
+                [self.values, values], axis=2
+            )
+            self.offset = self.keys.shape[2]
+            return self.keys, self.values
+
+        @property
+        def state(self):
+            return (self.keys, self.values)
+
+        def empty(self):
+            return self.offset == 0
+
+    class Attn:
+        def __init__(self, seed):
+            self.n_heads = _HybridFixture.HEADS
+            self.n_kv_heads = _HybridFixture.HEADS
+            self.head_dim = _HybridFixture.HEAD_DIM
+            g = mx.random.key(seed)
+            self.wq = mx.random.normal((16, self.n_heads * self.head_dim), key=g)
+            self.wk = mx.random.normal((16, self.n_heads * self.head_dim), key=g)
+
+        def project(self, x):
+            b, t, _ = x.shape
+            q = (x @ self.wq).reshape(b, t, self.n_heads, self.head_dim)
+            k = (x @ self.wk).reshape(b, t, self.n_heads, self.head_dim)
+            return q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3)
+
+        def __call__(self, x, mask=None, cache=None, **kwargs):
+            q, k = self.project(x)
+            if cache is not None:
+                keys, values = cache.update_and_fetch(k, k)
+            else:
+                keys, values = k, k
+            scores = mx.softmax(
+                (q @ keys.transpose(0, 1, 3, 2)) * self.head_dim**-0.5, axis=-1
+            )
+            out = (scores @ values).transpose(0, 2, 1, 3)
+            return out.reshape(x.shape[0], x.shape[1], -1)[..., :16]
+
+    class AttnLayer:
+        def __init__(self, seed):
+            self.self_attn = _HybridFixture.Attn(seed)
+
+        def __call__(self, x, cache=None):
+            return x + self.self_attn(x, cache=cache)
+
+    class RecurrentLayer:
+        def __call__(self, x, cache=None):
+            if cache is not None:
+                cache.seen += x.shape[1]
+                cache.cache = [mx.sum(x, axis=1), mx.sum(x, axis=1)]
+            return x * 1.0
+
+    def __init__(self, kinds="rara"):
+        self.kinds = kinds
+        self.layers = [
+            _HybridFixture.AttnLayer(i) if kind == "a" else _HybridFixture.RecurrentLayer()
+            for i, kind in enumerate(kinds)
+        ]
+        self.embed = mx.random.normal(
+            (self.VOCAB, 16), key=mx.random.key(99)
+        )
+        self.prefilled_tokens = []
+
+    def make_cache(self):
+        return [
+            _HybridFixture.KVCache() if kind == "a" else _HybridFixture.RecurrentCache()
+            for kind in self.kinds
+        ]
+
+    def __call__(self, tokens, cache=None):
+        self.prefilled_tokens.append(int(tokens.shape[-1]))
+        h = self.embed[tokens]
+        for idx, layer in enumerate(self.layers):
+            h = layer(h, cache=None if cache is None else cache[idx])
+        return h @ self.embed.T
+
+
+def _query_extractor(attn, x, cache, **kwargs):
+    q, _ = attn.project(x)
+    return q
+
+
+class TestScoreTokensHybridCacheReuse:
+    """score_tokens() must honour a restored cache on a hybrid model."""
+
+    @staticmethod
+    def _tokens(n):
+        return [(i * 7 + 3) % _HybridFixture.VOCAB for i in range(n)]
+
+    def test_layer_zero_reports_no_offset(self):
+        fixture = _HybridFixture()
+        cache = fixture.make_cache()
+        assert not hasattr(cache[0], "offset")
+        assert hasattr(cache[1], "offset")
+
+    def test_warm_cache_prefills_only_the_suffix(self):
+        from omlx.patches.specprefill import _prefill_draft, score_tokens
+
+        tokens = self._tokens(64)
+        fixture = _HybridFixture()
+        cache = fixture.make_cache()
+
+        # Restore the first 40 tokens, as a prefix-cache hit would.
+        _prefill_draft(fixture, tokens[:40], cache, step_size=8)
+        fixture.prefilled_tokens.clear()
+
+        score_tokens(
+            fixture,
+            tokens,
+            n_lookahead=2,
+            prefill_step_size=8,
+            temp=0.0,
+            query_extractor=_query_extractor,
+            existing_cache=cache,
+        )
+
+        # 24 suffix tokens, not 64. Before the fix this was the whole prompt.
+        # The trailing n_lookahead calls are decode steps, not prefill.
+        prefill_tokens = sum(fixture.prefilled_tokens[:-2])
+        assert prefill_tokens == 24
+
+    def test_cold_and_warm_scoring_agree(self):
+        from omlx.patches.specprefill import _prefill_draft, score_tokens
+
+        tokens = self._tokens(64)
+
+        cold_fixture = _HybridFixture()
+        cold_importance, _ = score_tokens(
+            cold_fixture,
+            tokens,
+            n_lookahead=2,
+            prefill_step_size=8,
+            temp=0.0,
+            query_extractor=_query_extractor,
+        )
+
+        warm_fixture = _HybridFixture()
+        warm_cache = warm_fixture.make_cache()
+        _prefill_draft(warm_fixture, tokens[:40], warm_cache, step_size=8)
+        warm_importance, _ = score_tokens(
+            warm_fixture,
+            tokens,
+            n_lookahead=2,
+            prefill_step_size=8,
+            temp=0.0,
+            query_extractor=_query_extractor,
+            existing_cache=warm_cache,
+        )
+
+        assert cold_importance.shape == warm_importance.shape == (64,)
+        assert mx.allclose(cold_importance, warm_importance, atol=1e-4).item()
+
+    def test_cold_and_warm_select_the_same_tokens(self):
+        from omlx.patches.specprefill import (
+            _prefill_draft,
+            score_tokens,
+            select_chunks,
+        )
+
+        tokens = self._tokens(128)
+
+        cold_fixture = _HybridFixture()
+        cold_importance, _ = score_tokens(
+            cold_fixture,
+            tokens,
+            n_lookahead=2,
+            prefill_step_size=16,
+            temp=0.0,
+            query_extractor=_query_extractor,
+        )
+
+        warm_fixture = _HybridFixture()
+        warm_cache = warm_fixture.make_cache()
+        _prefill_draft(warm_fixture, tokens[:96], warm_cache, step_size=16)
+        warm_importance, _ = score_tokens(
+            warm_fixture,
+            tokens,
+            n_lookahead=2,
+            prefill_step_size=16,
+            temp=0.0,
+            query_extractor=_query_extractor,
+            existing_cache=warm_cache,
+        )
+
+        cold_sel = select_chunks(cold_importance, keep_pct=0.5, chunk_size=8)
+        warm_sel = select_chunks(warm_importance, keep_pct=0.5, chunk_size=8)
+        assert cold_sel.tolist() == warm_sel.tolist()
+
+    def test_warm_cache_does_not_duplicate_the_prefix(self):
+        from omlx.patches.specprefill import _prefill_draft, score_tokens
+
+        tokens = self._tokens(64)
+        fixture = _HybridFixture()
+        cache = fixture.make_cache()
+        _prefill_draft(fixture, tokens[:40], cache, step_size=8)
+
+        score_tokens(
+            fixture,
+            tokens,
+            n_lookahead=2,
+            prefill_step_size=8,
+            temp=0.0,
+            query_extractor=_query_extractor,
+            existing_cache=cache,
+        )
+
+        # Length alone does not discriminate: the trim clamps to n_prompt
+        # either way. What a cached_len of 0 leaves behind is 104 keys trimmed
+        # to the FIRST 64 -- the 40 restored ones plus 24 of the duplicates --
+        # so compare content against a cache built the honest way.
+        cold_fixture = _HybridFixture()
+        cold_cache = cold_fixture.make_cache()
+        _prefill_draft(cold_fixture, tokens, cold_cache, step_size=8)
+
+        attn_cache = cache[1]
+        assert attn_cache.offset == 64
+        assert attn_cache.keys.shape[2] == 64
+        assert mx.allclose(
+            attn_cache.keys, cold_cache[1].keys, atol=1e-4
+        ).item()
